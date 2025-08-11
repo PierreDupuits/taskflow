@@ -907,50 +907,190 @@ class TaskFlow {
     }
     
     processVoiceCommand(text) {
+        console.log('Commande vocale reçue:', text);
         const lower = text.toLowerCase();
         
+        // Extraction intelligente des informations
         const task = {
             id: Date.now(),
-            title: text,
+            title: this.extractTitle(text),
             description: '',
             category: this.parseCategory(lower),
             priority: this.parsePriority(lower),
             status: 'todo',
             deadline: this.parseDeadline(lower),
-            estimatedTime: 1,
+            estimatedTime: this.parseTime(lower),
+            delegatedTo: this.parseDelegation(lower),
             space: this.currentSpace,
             createdAt: new Date().toISOString()
         };
         
+        // Si délégation détectée, mettre le statut approprié
+        if (task.delegatedTo) {
+            task.status = 'delegated';
+        }
+        
         this.tasks.push(task);
         this.saveTasks();
         this.render();
-        this.showNotification(`Tâche ajoutée: ${text}`, 'success');
+        this.showNotification(`Tâche ajoutée: ${task.title}`, 'success');
+    }
+    
+    extractTitle(text) {
+        // Retirer les mots-clés de contexte pour garder l'essentiel
+        let title = text;
+        
+        // Patterns à retirer
+        const patterns = [
+            /^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i,
+            /(urgent|urgente|importante?|priorité|prioritaire)/i,
+            /(pour demain|pour après-demain|avant|deadline)/i,
+            /(déléguer à|délégué à|pour|assigner à)/i,
+            /(méthode|qualité|maintenance)/i,
+            /(qui prend|qui dure|durée|temps|heures?|jours?)/i
+        ];
+        
+        // Nettoyer le titre mais garder les mots importants après les mots-clés
+        let cleanTitle = title;
+        
+        // Si la phrase commence par "ajoute/créer/etc", retirer ce début
+        if (/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i.test(cleanTitle)) {
+            cleanTitle = cleanTitle.replace(/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche):?\s*/i, '');
+        }
+        
+        // Capitaliser la première lettre
+        return cleanTitle.charAt(0).toUpperCase() + cleanTitle.slice(1);
     }
     
     parseCategory(text) {
-        if (text.includes('méthode')) return 'method';
-        if (text.includes('qualité')) return 'quality';
-        if (text.includes('maintenance')) return 'maintenance';
+        // Recherche plus flexible des catégories
+        if (/méthod|process|procéd/i.test(text)) return 'method';
+        if (/qualité|contrôle|audit|norme/i.test(text)) return 'quality';
+        if (/mainten|répara|entretien|SAV/i.test(text)) return 'maintenance';
+        
+        // Catégories basées sur des mots-clés contextuels
+        if (/réunion|meeting|rendez-vous|appel/i.test(text)) return 'method';
+        if (/rapport|document|révision|mise à jour/i.test(text)) return 'quality';
+        if (/vérif|check|test|diagnostic/i.test(text)) return 'maintenance';
+        
         return 'other';
     }
     
     parsePriority(text) {
-        if (text.includes('urgent') || text.includes('important')) return 'high';
-        if (text.includes('basse priorité')) return 'low';
+        // Détection améliorée de la priorité
+        if (/très urgent|urgentissime|critique|asap|tout de suite/i.test(text)) return 'high';
+        if (/urgent|important|priorit/i.test(text)) return 'high';
+        if (/normal|moyen|standard/i.test(text)) return 'medium';
+        if (/basse?|faible|peut attendre|pas urgent|tranquille/i.test(text)) return 'low';
+        
+        // Par défaut, si une deadline proche est mentionnée
+        if (/aujourd'hui|ce soir|maintenant/i.test(text)) return 'high';
+        if (/demain|domain/i.test(text)) return 'medium';
+        
         return 'medium';
     }
     
     parseDeadline(text) {
         const date = new Date();
-        if (text.includes('demain')) {
+        
+        // Dates relatives
+        if (/aujourd'hui|ce soir|fin de journée/i.test(text)) {
+            return date.toISOString().split('T')[0];
+        }
+        if (/demain|domain/i.test(text)) {
             date.setDate(date.getDate() + 1);
             return date.toISOString().split('T')[0];
         }
-        if (text.includes('après-demain')) {
+        if (/après[- ]demain/i.test(text)) {
             date.setDate(date.getDate() + 2);
             return date.toISOString().split('T')[0];
         }
+        
+        // Jours de la semaine
+        const jours = {
+            'lundi': 1, 'mardi': 2, 'mercredi': 3, 
+            'jeudi': 4, 'vendredi': 5, 'samedi': 6, 'dimanche': 0
+        };
+        
+        for (const [jour, num] of Object.entries(jours)) {
+            if (text.includes(jour)) {
+                const currentDay = date.getDay();
+                let daysToAdd = num - currentDay;
+                if (daysToAdd <= 0) daysToAdd += 7; // Semaine prochaine
+                date.setDate(date.getDate() + daysToAdd);
+                return date.toISOString().split('T')[0];
+            }
+        }
+        
+        // Détection "dans X jours"
+        const dansXJours = text.match(/dans (\d+) jours?/i);
+        if (dansXJours) {
+            date.setDate(date.getDate() + parseInt(dansXJours[1]));
+            return date.toISOString().split('T')[0];
+        }
+        
+        // Détection "avant le X"
+        const avantLe = text.match(/avant le (\d{1,2})/i);
+        if (avantLe) {
+            const jour = parseInt(avantLe[1]);
+            date.setDate(jour);
+            if (date < new Date()) {
+                date.setMonth(date.getMonth() + 1);
+            }
+            return date.toISOString().split('T')[0];
+        }
+        
+        return null;
+    }
+    
+    parseTime(text) {
+        // Extraction du temps estimé
+        const patterns = [
+            /(\d+)\s*h(?:eure)?s?/i,
+            /(\d+)\s*minute?s?/i,
+            /(\d+)\s*jour?s?/i,
+            /qui (?:prend|dure|prendra)\s*(\d+)/i
+        ];
+        
+        for (const pattern of patterns) {
+            const match = text.match(pattern);
+            if (match) {
+                const value = parseInt(match[1]);
+                if (pattern.toString().includes('minute')) {
+                    return Math.round(value / 60 * 10) / 10; // Convertir en heures
+                }
+                if (pattern.toString().includes('jour')) {
+                    return value * 8; // Considérer 8h par jour
+                }
+                return value;
+            }
+        }
+        
+        // Estimations basées sur des mots-clés
+        if (/rapide|vite|court|petit/i.test(text)) return 0.5;
+        if (/long|longue|complexe|gros|grosse/i.test(text)) return 4;
+        
+        return 1; // Par défaut
+    }
+    
+    parseDelegation(text) {
+        // Patterns pour détecter la délégation
+        const patterns = [
+            /(?:déléguer?|délégué|assigner?|assigné|donner?) (?:à|a) (\w+)/i,
+            /pour (\w+)$/i,
+            /(?:que|demander à) (\w+) (?:de|d')/i,
+            /(\w+) (?:doit|devra|va)/i
+        ];
+        
+        for (const pattern of patterns) {
+            const match = text.match(pattern);
+            if (match && match[1]) {
+                // Capitaliser le nom
+                const nom = match[1];
+                return nom.charAt(0).toUpperCase() + nom.slice(1).toLowerCase();
+            }
+        }
+        
         return null;
     }
     
