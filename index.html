@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#1976d2">
-<title>TaskFlow</title>
+<title>TaskFlow - Synchronisé</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--p:#1976d2;--s:#dc004e;--ok:#4caf50;--warn:#ff9800;--err:#f44336;--dark:#1a1a1a;--light:#fff;--gray-l:#f5f5f5;--gray:#9e9e9e;--sh:0 2px 4px rgba(0,0,0,.1);--r:8px}
@@ -22,6 +22,11 @@ body.dark .kanban-column{background:rgba(30,30,30,.7)}
 .header-actions{display:flex;gap:1rem;align-items:center}
 .icon-btn{background:0;border:0;color:#fff;cursor:pointer;padding:.5rem;border-radius:50%;transition:.3s}
 .icon-btn:hover{background:rgba(255,255,255,.2)}
+
+.sync-indicator{display:inline-flex;align-items:center;gap:0.5rem;padding:0.25rem 0.75rem;background:rgba(255,255,255,0.2);border-radius:20px;font-size:0.875rem}
+.sync-indicator.syncing{animation:pulse 2s infinite}
+.sync-indicator.offline{background:rgba(255,100,100,0.3)}
+
 .main-container{max-width:1400px;margin:2rem auto;padding:0 1rem}
 .filters-bar{background:#fff;padding:1rem;border-radius:var(--r);box-shadow:var(--sh);margin-bottom:2rem;display:flex;gap:1rem;flex-wrap:wrap;align-items:center}
 .filter-group{display:flex;gap:.5rem;align-items:center}
@@ -122,6 +127,10 @@ select:focus,input:focus{outline:0;border-color:var(--p);box-shadow:0 0 0 3px rg
 </div>
 </div>
 <div class="header-actions">
+<div class="sync-indicator" id="sync-indicator">
+<span id="sync-icon">🔄</span>
+<span id="sync-text">Synchronisé</span>
+</div>
 <button class="icon-btn" data-action="kpi" title="KPIs">📈</button>
 <button class="icon-btn" data-action="stats" title="Statistiques">📊</button>
 <button class="icon-btn" data-action="export" title="Exporter">📥</button>
@@ -170,20 +179,51 @@ select:focus,input:focus{outline:0;border-color:var(--p);box-shadow:0 0 0 3px rg
 <div class="modal" id="kpi-modal"></div>
 <div class="notification" id="notification"></div>
 
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+
 <script>
 'use strict';
 
-// Gestionnaire de tâches simple et efficace
-class TaskFlow {
+// Configuration Firebase
+const firebaseConfig = {
+  apiKey: "AIzaSyA0Nq9x4iFK7igvDwdAvy_EeQAISNOu-L0",
+  authDomain: "taskflow-d60a7.firebaseapp.com",
+  projectId: "taskflow-d60a7",
+  storageBucket: "taskflow-d60a7.firebasestorage.app",
+  messagingSenderId: "702172024297",
+  appId: "1:702172024297:web:f275430edb60ae0d7a0f78",
+  measurementId: "G-3KRLKNW8R4"
+};
+
+// Initialiser Firebase
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+
+// Enable offline persistence
+db.enablePersistence()
+  .catch((err) => {
+      if (err.code === 'failed-precondition') {
+          console.log('Persistence failed: Multiple tabs open');
+      } else if (err.code === 'unimplemented') {
+          console.log('Persistence not available');
+      }
+  });
+
+// Gestionnaire de tâches avec Firebase
+class TaskFlowFirebase {
     constructor() {
         // État global
         this.currentSpace = localStorage.getItem('currentSpace') || 'professional';
         this.darkMode = localStorage.getItem('darkMode') === 'true';
+        this.tasks = [];
+        this.unsubscribe = null;
         
-        // État temporaire - IMPORTANT: bien séparer les états
+        // État temporaire
         this.editingTaskId = null;
         this.delegatingTaskId = null;
-        this.draggedTaskId = null; // On stocke seulement l'ID, pas l'élément
+        this.draggedTaskId = null;
         
         // Configuration
         this.categories = {
@@ -204,21 +244,108 @@ class TaskFlow {
     }
     
     init() {
-        // Charger les tâches existantes d'abord
-        const saved = localStorage.getItem('tasks');
-        if (saved) {
-            this.tasks = JSON.parse(saved);
-        } else {
-            // Initialiser avec un tableau vide
-            this.tasks = [];
-            this.saveTasks();
-        }
-        
         this.setupEventListeners();
         this.applyTheme();
-        this.render();
+        this.setupFirestoreListener();
         this.setupSpeechRecognition();
         this.startPeriodicChecks();
+        this.monitorConnection();
+    }
+    
+    // Firebase Listener
+    setupFirestoreListener() {
+        // Afficher l'indicateur de chargement
+        this.updateSyncIndicator('syncing', 'Synchronisation...');
+        
+        // Écouter les changements en temps réel
+        this.unsubscribe = db.collection('tasks')
+            .onSnapshot((snapshot) => {
+                this.tasks = [];
+                snapshot.forEach((doc) => {
+                    this.tasks.push({ ...doc.data(), id: doc.id });
+                });
+                this.render();
+                this.updateSyncIndicator('synced', 'Synchronisé');
+            }, (error) => {
+                console.error('Erreur Firestore:', error);
+                this.updateSyncIndicator('error', 'Erreur de sync');
+                this.showNotification('Erreur de synchronisation', 'error');
+            });
+    }
+    
+    // Monitorer la connexion
+    monitorConnection() {
+        window.addEventListener('online', () => {
+            this.updateSyncIndicator('synced', 'En ligne');
+            this.showNotification('Connexion rétablie', 'success');
+        });
+        
+        window.addEventListener('offline', () => {
+            this.updateSyncIndicator('offline', 'Hors ligne');
+            this.showNotification('Mode hors ligne - Les modifications seront synchronisées', 'warning');
+        });
+    }
+    
+    updateSyncIndicator(status, text) {
+        const indicator = document.getElementById('sync-indicator');
+        const icon = document.getElementById('sync-icon');
+        const textEl = document.getElementById('sync-text');
+        
+        indicator.className = 'sync-indicator';
+        
+        switch(status) {
+            case 'syncing':
+                indicator.classList.add('syncing');
+                icon.textContent = '🔄';
+                break;
+            case 'synced':
+                icon.textContent = '✅';
+                break;
+            case 'offline':
+                indicator.classList.add('offline');
+                icon.textContent = '🔌';
+                break;
+            case 'error':
+                indicator.classList.add('offline');
+                icon.textContent = '❌';
+                break;
+        }
+        
+        textEl.textContent = text;
+    }
+    
+    // Sauvegarder une tâche dans Firebase
+    async saveTaskToFirebase(task) {
+        try {
+            this.updateSyncIndicator('syncing', 'Sauvegarde...');
+            
+            if (task.id && typeof task.id === 'string') {
+                // Mise à jour
+                await db.collection('tasks').doc(task.id).update(task);
+            } else {
+                // Création - Retirer l'ID temporaire
+                const { id, ...taskData } = task;
+                await db.collection('tasks').add(taskData);
+            }
+            
+            this.updateSyncIndicator('synced', 'Synchronisé');
+        } catch (error) {
+            console.error('Erreur sauvegarde:', error);
+            this.showNotification('Erreur de sauvegarde', 'error');
+            this.updateSyncIndicator('error', 'Erreur');
+        }
+    }
+    
+    // Supprimer une tâche de Firebase
+    async deleteTaskFromFirebase(taskId) {
+        try {
+            this.updateSyncIndicator('syncing', 'Suppression...');
+            await db.collection('tasks').doc(taskId).delete();
+            this.updateSyncIndicator('synced', 'Synchronisé');
+        } catch (error) {
+            console.error('Erreur suppression:', error);
+            this.showNotification('Erreur de suppression', 'error');
+        }
     }
     
     setupEventListeners() {
@@ -242,14 +369,14 @@ class TaskFlow {
             // Suppression de tâche
             if (target.matches('.delete-btn')) {
                 e.stopPropagation();
-                const taskId = parseInt(target.closest('.task-card').dataset.taskId);
+                const taskId = target.closest('.task-card').dataset.taskId;
                 this.deleteTask(taskId);
             }
             
-            // Édition de tâche - SEULEMENT si on n'est pas en train de drag
+            // Édition de tâche
             const taskCard = target.closest('.task-card');
             if (taskCard && !target.matches('.delete-btn') && this.draggedTaskId === null) {
-                const taskId = parseInt(taskCard.dataset.taskId);
+                const taskId = taskCard.dataset.taskId;
                 this.editTask(taskId);
             }
             
@@ -397,22 +524,21 @@ class TaskFlow {
         
         div.innerHTML = html;
         
+        // Événements de drag
         div.addEventListener('dragstart', (e) => {
             e.stopPropagation();
             this.draggedTaskId = task.id;
-            // Ajouter la classe après un court délai pour permettre au navigateur de capturer l'image
             setTimeout(() => {
                 e.target.classList.add('dragging');
             }, 0);
             e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', task.id.toString());
+            e.dataTransfer.setData('text/plain', task.id);
         });
         
         div.addEventListener('dragend', (e) => {
             e.stopPropagation();
             e.target.classList.remove('dragging');
             this.draggedTaskId = null;
-            // Nettoyer toutes les zones de drop
             document.querySelectorAll('.drag-over').forEach(el => {
                 el.classList.remove('drag-over');
             });
@@ -425,12 +551,6 @@ class TaskFlow {
         document.querySelectorAll('.kanban-column').forEach(column => {
             const container = column.querySelector('.tasks-container');
             
-            // Supprimer les anciens listeners
-            column.ondragover = null;
-            column.ondragleave = null;
-            column.ondrop = null;
-            
-            // Empêcher le comportement par défaut
             column.ondragover = (e) => {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = 'move';
@@ -448,24 +568,16 @@ class TaskFlow {
                 e.stopPropagation();
                 container.classList.remove('drag-over');
                 
-                // IMPORTANT: Vérifier qu'on a bien un ID et qu'on ne drop pas sur la même colonne
                 if (this.draggedTaskId !== null) {
-                    const task = this.tasks.find(t => t.id === this.draggedTaskId);
                     const newStatus = column.dataset.status;
-                    
-                    if (task && task.status !== newStatus) {
-                        this.updateTaskStatus(this.draggedTaskId, newStatus);
-                    }
-                    
-                    // Toujours réinitialiser après le drop
+                    this.updateTaskStatus(this.draggedTaskId, newStatus);
                     this.draggedTaskId = null;
                 }
             };
         });
     }
     
-    updateTaskStatus(taskId, newStatus) {
-        // Vérifier qu'on a un ID valide
+    async updateTaskStatus(taskId, newStatus) {
         if (!taskId) return;
         
         const task = this.tasks.find(t => t.id === taskId);
@@ -485,17 +597,12 @@ class TaskFlow {
             task.completedAt = new Date().toISOString();
         }
         
-        this.saveTasks();
-        
-        // Attendre que le drag soit terminé avant de re-render
-        setTimeout(() => {
-            this.render();
-            this.showNotification('Statut mis à jour', 'success');
-        }, 100);
+        await this.saveTaskToFirebase(task);
+        this.showNotification('Statut mis à jour', 'success');
     }
     
     createTask() {
-        this.editingTaskId = null; // S'assurer qu'on est en mode création
+        this.editingTaskId = null;
         this.showTaskModal();
     }
     
@@ -504,11 +611,9 @@ class TaskFlow {
         this.showTaskModal();
     }
     
-    deleteTask(taskId) {
+    async deleteTask(taskId) {
         if (confirm('Supprimer cette tâche ?')) {
-            this.tasks = this.tasks.filter(t => t.id !== taskId);
-            this.saveTasks();
-            this.render();
+            await this.deleteTaskFromFirebase(taskId);
             this.showNotification('Tâche supprimée', 'success');
         }
     }
@@ -580,61 +685,38 @@ class TaskFlow {
         this.openModal('task-modal');
     }
     
-    saveTask(event) {
+    async saveTask(event) {
         event.preventDefault();
         const formData = new FormData(event.target);
         const data = Object.fromEntries(formData);
         
-        if (this.editingTaskId !== null) {
-            // Mode édition - NE PAS créer de nouvelle tâche
-            const index = this.tasks.findIndex(t => t.id === this.editingTaskId);
-            if (index !== -1) {
-                // Conserver les données existantes et mettre à jour seulement ce qui a changé
-                this.tasks[index] = {
-                    ...this.tasks[index],
-                    title: data.title,
-                    description: data.description,
-                    category: data.category,
-                    priority: data.priority,
-                    status: data.status,
-                    deadline: data.deadline,
-                    estimatedTime: parseFloat(data.estimatedTime) || 0,
-                    delegatedTo: data.delegatedTo
-                };
-                
-                if (data.status === 'done' && !this.tasks[index].completedAt) {
-                    this.tasks[index].completedAt = new Date().toISOString();
-                }
-            }
-        } else {
-            // Mode création - créer une nouvelle tâche
-            const newTask = {
-                id: Date.now(),
-                title: data.title,
-                description: data.description,
-                category: data.category,
-                priority: data.priority,
-                status: data.status,
-                deadline: data.deadline,
-                estimatedTime: parseFloat(data.estimatedTime) || 0,
-                delegatedTo: data.delegatedTo,
-                space: this.currentSpace,
-                createdAt: new Date().toISOString()
-            };
-            
-            if (newTask.status === 'done') {
-                newTask.completedAt = new Date().toISOString();
-            }
-            
-            this.tasks.push(newTask);
+        const taskData = {
+            title: data.title,
+            description: data.description,
+            category: data.category,
+            priority: data.priority,
+            status: data.status,
+            deadline: data.deadline,
+            estimatedTime: parseFloat(data.estimatedTime) || 0,
+            delegatedTo: data.delegatedTo,
+            space: this.currentSpace,
+            createdAt: this.editingTaskId ? 
+                (this.tasks.find(t => t.id === this.editingTaskId)?.createdAt || new Date().toISOString()) : 
+                new Date().toISOString()
+        };
+        
+        if (taskData.status === 'done') {
+            taskData.completedAt = taskData.completedAt || new Date().toISOString();
         }
         
-        this.saveTasks();
-        this.render();
-        this.closeModal('task-modal');
-        this.showNotification(this.editingTaskId !== null ? 'Tâche mise à jour' : 'Tâche créée', 'success');
+        if (this.editingTaskId) {
+            taskData.id = this.editingTaskId;
+        }
         
-        // Réinitialiser l'état d'édition
+        await this.saveTaskToFirebase(taskData);
+        
+        this.closeModal('task-modal');
+        this.showNotification(this.editingTaskId ? 'Tâche mise à jour' : 'Tâche créée', 'success');
         this.editingTaskId = null;
     }
     
@@ -667,7 +749,7 @@ class TaskFlow {
         this.openModal('delegate-modal');
     }
     
-    saveDelegate(event) {
+    async saveDelegate(event) {
         event.preventDefault();
         if (!this.delegatingTaskId) return;
         
@@ -679,8 +761,8 @@ class TaskFlow {
             task.delegateReminder = formData.get('reminder');
             task.status = 'delegated';
             
-            this.saveTasks();
-            this.render();
+            await this.saveTaskToFirebase(task);
+            
             this.closeModal('delegate-modal');
             this.showNotification('Tâche déléguée', 'success');
         }
@@ -691,6 +773,192 @@ class TaskFlow {
     toggleDelegatedField(status) {
         document.getElementById('delegated-group').style.display = 
             status === 'delegated' ? 'block' : 'none';
+    }
+    
+    // Reconnaissance vocale améliorée
+    processVoiceCommand(text) {
+        console.log('Commande vocale reçue:', text);
+        const lower = text.toLowerCase();
+        
+        // Extraction intelligente des informations
+        const task = {
+            title: this.extractTitle(text),
+            description: '',
+            category: this.parseCategory(lower),
+            priority: this.parsePriority(lower),
+            status: 'todo',
+            deadline: this.parseDeadline(lower),
+            estimatedTime: this.parseTime(lower),
+            delegatedTo: this.parseDelegation(lower),
+            space: this.currentSpace,
+            createdAt: new Date().toISOString()
+        };
+        
+        // Si délégation détectée, mettre le statut approprié
+        if (task.delegatedTo) {
+            task.status = 'delegated';
+        }
+        
+        this.saveTaskToFirebase(task);
+        this.showNotification(`Tâche ajoutée: ${task.title}`, 'success');
+    }
+    
+    extractTitle(text) {
+        // Retirer les mots-clés de contexte pour garder l'essentiel
+        let title = text;
+        
+        // Patterns à retirer
+        const patterns = [
+            /^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i,
+            /(urgent|urgente|importante?|priorité|prioritaire)/i,
+            /(pour demain|pour après-demain|avant|deadline)/i,
+            /(déléguer à|délégué à|pour|assigner à)/i,
+            /(méthode|qualité|maintenance)/i,
+            /(qui prend|qui dure|durée|temps|heures?|jours?)/i
+        ];
+        
+        // Nettoyer le titre mais garder les mots importants après les mots-clés
+        let cleanTitle = title;
+        
+        // Si la phrase commence par "ajoute/créer/etc", retirer ce début
+        if (/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i.test(cleanTitle)) {
+            cleanTitle = cleanTitle.replace(/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche):?\s*/i, '');
+        }
+        
+        // Capitaliser la première lettre
+        return cleanTitle.charAt(0).toUpperCase() + cleanTitle.slice(1);
+    }
+    
+    parseCategory(text) {
+        // Recherche plus flexible des catégories
+        if (/méthod|process|procéd/i.test(text)) return 'method';
+        if (/qualité|contrôle|audit|norme/i.test(text)) return 'quality';
+        if (/mainten|répara|entretien|SAV/i.test(text)) return 'maintenance';
+        
+        // Catégories basées sur des mots-clés contextuels
+        if (/réunion|meeting|rendez-vous|appel/i.test(text)) return 'method';
+        if (/rapport|document|révision|mise à jour/i.test(text)) return 'quality';
+        if (/vérif|check|test|diagnostic/i.test(text)) return 'maintenance';
+        
+        return 'other';
+    }
+    
+    parsePriority(text) {
+        // Détection améliorée de la priorité
+        if (/très urgent|urgentissime|critique|asap|tout de suite/i.test(text)) return 'high';
+        if (/urgent|important|priorit/i.test(text)) return 'high';
+        if (/normal|moyen|standard/i.test(text)) return 'medium';
+        if (/basse?|faible|peut attendre|pas urgent|tranquille/i.test(text)) return 'low';
+        
+        // Par défaut, si une deadline proche est mentionnée
+        if (/aujourd'hui|ce soir|maintenant/i.test(text)) return 'high';
+        if (/demain|domain/i.test(text)) return 'medium';
+        
+        return 'medium';
+    }
+    
+    parseDeadline(text) {
+        const date = new Date();
+        
+        // Dates relatives
+        if (/aujourd'hui|ce soir|fin de journée/i.test(text)) {
+            return date.toISOString().split('T')[0];
+        }
+        if (/demain|domain/i.test(text)) {
+            date.setDate(date.getDate() + 1);
+            return date.toISOString().split('T')[0];
+        }
+        if (/après[- ]demain/i.test(text)) {
+            date.setDate(date.getDate() + 2);
+            return date.toISOString().split('T')[0];
+        }
+        
+        // Jours de la semaine
+        const jours = {
+            'lundi': 1, 'mardi': 2, 'mercredi': 3, 
+            'jeudi': 4, 'vendredi': 5, 'samedi': 6, 'dimanche': 0
+        };
+        
+        for (const [jour, num] of Object.entries(jours)) {
+            if (text.includes(jour)) {
+                const currentDay = date.getDay();
+                let daysToAdd = num - currentDay;
+                if (daysToAdd <= 0) daysToAdd += 7; // Semaine prochaine
+                date.setDate(date.getDate() + daysToAdd);
+                return date.toISOString().split('T')[0];
+            }
+        }
+        
+        // Détection "dans X jours"
+        const dansXJours = text.match(/dans (\d+) jours?/i);
+        if (dansXJours) {
+            date.setDate(date.getDate() + parseInt(dansXJours[1]));
+            return date.toISOString().split('T')[0];
+        }
+        
+        // Détection "avant le X"
+        const avantLe = text.match(/avant le (\d{1,2})/i);
+        if (avantLe) {
+            const jour = parseInt(avantLe[1]);
+            date.setDate(jour);
+            if (date < new Date()) {
+                date.setMonth(date.getMonth() + 1);
+            }
+            return date.toISOString().split('T')[0];
+        }
+        
+        return null;
+    }
+    
+    parseTime(text) {
+        // Extraction du temps estimé
+        const patterns = [
+            /(\d+)\s*h(?:eure)?s?/i,
+            /(\d+)\s*minute?s?/i,
+            /(\d+)\s*jour?s?/i,
+            /qui (?:prend|dure|prendra)\s*(\d+)/i
+        ];
+        
+        for (const pattern of patterns) {
+            const match = text.match(pattern);
+            if (match) {
+                const value = parseInt(match[1]);
+                if (pattern.toString().includes('minute')) {
+                    return Math.round(value / 60 * 10) / 10; // Convertir en heures
+                }
+                if (pattern.toString().includes('jour')) {
+                    return value * 8; // Considérer 8h par jour
+                }
+                return value;
+            }
+        }
+        
+        // Estimations basées sur des mots-clés
+        if (/rapide|vite|court|petit/i.test(text)) return 0.5;
+        if (/long|longue|complexe|gros|grosse/i.test(text)) return 4;
+        
+        return 1; // Par défaut
+    }
+    
+    parseDelegation(text) {
+        // Patterns pour détecter la délégation
+        const patterns = [
+            /(?:déléguer?|délégué|assigner?|assigné|donner?) (?:à|a) (\w+)/i,
+            /pour (\w+)$/i,
+            /(?:que|demander à) (\w+) (?:de|d')/i,
+            /(\w+) (?:doit|devra|va)/i
+        ];
+        
+        for (const pattern of patterns) {
+            const match = text.match(pattern);
+            if (match && match[1]) {
+                // Capitaliser le nom
+                const nom = match[1];
+                return nom.charAt(0).toUpperCase() + nom.slice(1).toLowerCase();
+            }
+        }
+        
+        return null;
     }
     
     // Autres méthodes utilitaires...
@@ -906,194 +1174,6 @@ class TaskFlow {
         }
     }
     
-    processVoiceCommand(text) {
-        console.log('Commande vocale reçue:', text);
-        const lower = text.toLowerCase();
-        
-        // Extraction intelligente des informations
-        const task = {
-            id: Date.now(),
-            title: this.extractTitle(text),
-            description: '',
-            category: this.parseCategory(lower),
-            priority: this.parsePriority(lower),
-            status: 'todo',
-            deadline: this.parseDeadline(lower),
-            estimatedTime: this.parseTime(lower),
-            delegatedTo: this.parseDelegation(lower),
-            space: this.currentSpace,
-            createdAt: new Date().toISOString()
-        };
-        
-        // Si délégation détectée, mettre le statut approprié
-        if (task.delegatedTo) {
-            task.status = 'delegated';
-        }
-        
-        this.tasks.push(task);
-        this.saveTasks();
-        this.render();
-        this.showNotification(`Tâche ajoutée: ${task.title}`, 'success');
-    }
-    
-    extractTitle(text) {
-        // Retirer les mots-clés de contexte pour garder l'essentiel
-        let title = text;
-        
-        // Patterns à retirer
-        const patterns = [
-            /^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i,
-            /(urgent|urgente|importante?|priorité|prioritaire)/i,
-            /(pour demain|pour après-demain|avant|deadline)/i,
-            /(déléguer à|délégué à|pour|assigner à)/i,
-            /(méthode|qualité|maintenance)/i,
-            /(qui prend|qui dure|durée|temps|heures?|jours?)/i
-        ];
-        
-        // Nettoyer le titre mais garder les mots importants après les mots-clés
-        let cleanTitle = title;
-        
-        // Si la phrase commence par "ajoute/créer/etc", retirer ce début
-        if (/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i.test(cleanTitle)) {
-            cleanTitle = cleanTitle.replace(/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche):?\s*/i, '');
-        }
-        
-        // Capitaliser la première lettre
-        return cleanTitle.charAt(0).toUpperCase() + cleanTitle.slice(1);
-    }
-    
-    parseCategory(text) {
-        // Recherche plus flexible des catégories
-        if (/méthod|process|procéd/i.test(text)) return 'method';
-        if (/qualité|contrôle|audit|norme/i.test(text)) return 'quality';
-        if (/mainten|répara|entretien|SAV/i.test(text)) return 'maintenance';
-        
-        // Catégories basées sur des mots-clés contextuels
-        if (/réunion|meeting|rendez-vous|appel/i.test(text)) return 'method';
-        if (/rapport|document|révision|mise à jour/i.test(text)) return 'quality';
-        if (/vérif|check|test|diagnostic/i.test(text)) return 'maintenance';
-        
-        return 'other';
-    }
-    
-    parsePriority(text) {
-        // Détection améliorée de la priorité
-        if (/très urgent|urgentissime|critique|asap|tout de suite/i.test(text)) return 'high';
-        if (/urgent|important|priorit/i.test(text)) return 'high';
-        if (/normal|moyen|standard/i.test(text)) return 'medium';
-        if (/basse?|faible|peut attendre|pas urgent|tranquille/i.test(text)) return 'low';
-        
-        // Par défaut, si une deadline proche est mentionnée
-        if (/aujourd'hui|ce soir|maintenant/i.test(text)) return 'high';
-        if (/demain|domain/i.test(text)) return 'medium';
-        
-        return 'medium';
-    }
-    
-    parseDeadline(text) {
-        const date = new Date();
-        
-        // Dates relatives
-        if (/aujourd'hui|ce soir|fin de journée/i.test(text)) {
-            return date.toISOString().split('T')[0];
-        }
-        if (/demain|domain/i.test(text)) {
-            date.setDate(date.getDate() + 1);
-            return date.toISOString().split('T')[0];
-        }
-        if (/après[- ]demain/i.test(text)) {
-            date.setDate(date.getDate() + 2);
-            return date.toISOString().split('T')[0];
-        }
-        
-        // Jours de la semaine
-        const jours = {
-            'lundi': 1, 'mardi': 2, 'mercredi': 3, 
-            'jeudi': 4, 'vendredi': 5, 'samedi': 6, 'dimanche': 0
-        };
-        
-        for (const [jour, num] of Object.entries(jours)) {
-            if (text.includes(jour)) {
-                const currentDay = date.getDay();
-                let daysToAdd = num - currentDay;
-                if (daysToAdd <= 0) daysToAdd += 7; // Semaine prochaine
-                date.setDate(date.getDate() + daysToAdd);
-                return date.toISOString().split('T')[0];
-            }
-        }
-        
-        // Détection "dans X jours"
-        const dansXJours = text.match(/dans (\d+) jours?/i);
-        if (dansXJours) {
-            date.setDate(date.getDate() + parseInt(dansXJours[1]));
-            return date.toISOString().split('T')[0];
-        }
-        
-        // Détection "avant le X"
-        const avantLe = text.match(/avant le (\d{1,2})/i);
-        if (avantLe) {
-            const jour = parseInt(avantLe[1]);
-            date.setDate(jour);
-            if (date < new Date()) {
-                date.setMonth(date.getMonth() + 1);
-            }
-            return date.toISOString().split('T')[0];
-        }
-        
-        return null;
-    }
-    
-    parseTime(text) {
-        // Extraction du temps estimé
-        const patterns = [
-            /(\d+)\s*h(?:eure)?s?/i,
-            /(\d+)\s*minute?s?/i,
-            /(\d+)\s*jour?s?/i,
-            /qui (?:prend|dure|prendra)\s*(\d+)/i
-        ];
-        
-        for (const pattern of patterns) {
-            const match = text.match(pattern);
-            if (match) {
-                const value = parseInt(match[1]);
-                if (pattern.toString().includes('minute')) {
-                    return Math.round(value / 60 * 10) / 10; // Convertir en heures
-                }
-                if (pattern.toString().includes('jour')) {
-                    return value * 8; // Considérer 8h par jour
-                }
-                return value;
-            }
-        }
-        
-        // Estimations basées sur des mots-clés
-        if (/rapide|vite|court|petit/i.test(text)) return 0.5;
-        if (/long|longue|complexe|gros|grosse/i.test(text)) return 4;
-        
-        return 1; // Par défaut
-    }
-    
-    parseDelegation(text) {
-        // Patterns pour détecter la délégation
-        const patterns = [
-            /(?:déléguer?|délégué|assigner?|assigné|donner?) (?:à|a) (\w+)/i,
-            /pour (\w+)$/i,
-            /(?:que|demander à) (\w+) (?:de|d')/i,
-            /(\w+) (?:doit|devra|va)/i
-        ];
-        
-        for (const pattern of patterns) {
-            const match = text.match(pattern);
-            if (match && match[1]) {
-                // Capitaliser le nom
-                const nom = match[1];
-                return nom.charAt(0).toUpperCase() + nom.slice(1).toLowerCase();
-            }
-        }
-        
-        return null;
-    }
-    
     startPeriodicChecks() {
         setInterval(() => this.checkDeadlines(), 60000);
         this.checkDeadlines();
@@ -1156,10 +1236,6 @@ class TaskFlow {
         }
     }
     
-    saveTasks() {
-        localStorage.setItem('tasks', JSON.stringify(this.tasks));
-    }
-    
     // Date utilities
     formatDate(dateString) {
         return new Date(dateString).toLocaleDateString('fr-FR');
@@ -1190,13 +1266,25 @@ class TaskFlow {
             timeout = setTimeout(() => func.apply(this, args), wait);
         };
     }
+    
+    // Cleanup on page unload
+    destroy() {
+        if (this.unsubscribe) {
+            this.unsubscribe();
+        }
+    }
 }
 
 // Initialisation
-const app = new TaskFlow();
+const app = new TaskFlowFirebase();
 
 // Rendre l'app globale pour les événements inline
 window.app = app;
+
+// Cleanup on page unload
+window.addEventListener('beforeunload', () => {
+    app.destroy();
+});
 
 // Service Worker pour PWA
 if ('serviceWorker' in navigator) {
