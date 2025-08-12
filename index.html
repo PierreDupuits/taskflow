@@ -22,6 +22,8 @@ body.dark .kanban-column{background:rgba(30,30,30,.7)}
 .header-actions{display:flex;gap:1rem;align-items:center}
 .icon-btn{background:0;border:0;color:#fff;cursor:pointer;padding:.5rem;border-radius:50%;transition:.3s}
 .icon-btn:hover{background:rgba(255,255,255,.2)}
+.icon-btn[data-action="refresh"]{transition:transform 0.3s}
+.icon-btn[data-action="refresh"]:active{transform:rotate(180deg)}
 
 .sync-indicator{display:inline-flex;align-items:center;gap:0.5rem;padding:0.25rem 0.75rem;background:rgba(255,255,255,0.2);border-radius:20px;font-size:0.875rem}
 .sync-indicator.syncing{animation:pulse 2s infinite}
@@ -131,11 +133,10 @@ select:focus,input:focus{outline:0;border-color:var(--p);box-shadow:0 0 0 3px rg
 <span id="sync-icon">🔄</span>
 <span id="sync-text">Synchronisé</span>
 </div>
+<button class="icon-btn" data-action="refresh" title="Rafraîchir">🔄</button>
 <button class="icon-btn" data-action="kpi" title="KPIs">📈</button>
-<button class="icon-btn" data-action="stats" title="Statistiques">📊</button>
 <button class="icon-btn" data-action="export" title="Exporter">📥</button>
 <button class="icon-btn" data-action="theme" title="Changer le thème">🌙</button>
-<button class="icon-btn" data-action="settings" title="Paramètres">⚙️</button>
 </div>
 </div>
 </header>
@@ -187,45 +188,30 @@ select:focus,input:focus{outline:0;border-color:var(--p);box-shadow:0 0 0 3px rg
 'use strict';
 
 // Configuration Firebase
-const firebaseConfig = {
+firebase.initializeApp({
   apiKey: "AIzaSyA0Nq9x4iFK7igvDwdAvy_EeQAISNOu-L0",
   authDomain: "taskflow-d60a7.firebaseapp.com",
   projectId: "taskflow-d60a7",
   storageBucket: "taskflow-d60a7.firebasestorage.app",
   messagingSenderId: "702172024297",
-  appId: "1:702172024297:web:f275430edb60ae0d7a0f78",
-  measurementId: "G-3KRLKNW8R4"
-};
+  appId: "1:702172024297:web:f275430edb60ae0d7a0f78"
+});
 
-// Initialiser Firebase
-firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
 
 // Enable offline persistence
-db.enablePersistence()
-  .catch((err) => {
-      if (err.code === 'failed-precondition') {
-          console.log('Persistence failed: Multiple tabs open');
-      } else if (err.code === 'unimplemented') {
-          console.log('Persistence not available');
-      }
-  });
+db.enablePersistence().catch(console.error);
 
-// Gestionnaire de tâches avec Firebase
-class TaskFlowFirebase {
+class TaskFlowSync {
     constructor() {
-        // État global
         this.currentSpace = localStorage.getItem('currentSpace') || 'professional';
         this.darkMode = localStorage.getItem('darkMode') === 'true';
-        this.tasks = [];
+        this.tasks = new Map(); // Utiliser Map pour éviter les doublons
         this.unsubscribe = null;
-        
-        // État temporaire
         this.editingTaskId = null;
         this.delegatingTaskId = null;
         this.draggedTaskId = null;
         
-        // Configuration
         this.categories = {
             method: 'Méthode',
             quality: 'Qualité', 
@@ -243,164 +229,123 @@ class TaskFlowFirebase {
         this.init();
     }
     
-    init() {
+    async init() {
         this.setupEventListeners();
         this.applyTheme();
-        this.setupFirestoreListener();
+        this.updateSpaceButtons();
+        await this.loadTasks();
         this.setupSpeechRecognition();
         this.startPeriodicChecks();
         this.monitorConnection();
     }
     
-    // Firebase Listener
-    setupFirestoreListener() {
-        // Afficher l'indicateur de chargement
-        this.updateSyncIndicator('syncing', 'Synchronisation...');
-        
-        // Écouter les changements en temps réel
-        this.unsubscribe = db.collection('tasks')
-            .onSnapshot((snapshot) => {
-                this.tasks = [];
-                snapshot.forEach((doc) => {
-                    this.tasks.push({ ...doc.data(), id: doc.id });
-                });
-                this.render();
-                this.updateSyncIndicator('synced', 'Synchronisé');
-            }, (error) => {
-                console.error('Erreur Firestore:', error);
-                this.updateSyncIndicator('error', 'Erreur de sync');
-                this.showNotification('Erreur de synchronisation', 'error');
-            });
-    }
-    
-    // Monitorer la connexion
-    monitorConnection() {
-        window.addEventListener('online', () => {
-            this.updateSyncIndicator('synced', 'En ligne');
-            this.showNotification('Connexion rétablie', 'success');
-        });
-        
-        window.addEventListener('offline', () => {
-            this.updateSyncIndicator('offline', 'Hors ligne');
-            this.showNotification('Mode hors ligne - Les modifications seront synchronisées', 'warning');
-        });
-    }
-    
-    updateSyncIndicator(status, text) {
-        const indicator = document.getElementById('sync-indicator');
-        const icon = document.getElementById('sync-icon');
-        const textEl = document.getElementById('sync-text');
-        
-        indicator.className = 'sync-indicator';
-        
-        switch(status) {
-            case 'syncing':
-                indicator.classList.add('syncing');
-                icon.textContent = '🔄';
-                break;
-            case 'synced':
-                icon.textContent = '✅';
-                break;
-            case 'offline':
-                indicator.classList.add('offline');
-                icon.textContent = '🔌';
-                break;
-            case 'error':
-                indicator.classList.add('offline');
-                icon.textContent = '❌';
-                break;
+    async loadTasks() {
+        // Désinscrire l'ancien listener
+        if (this.unsubscribe) {
+            this.unsubscribe();
+            this.unsubscribe = null;
         }
         
-        textEl.textContent = text;
-    }
-    
-    // Sauvegarder une tâche dans Firebase
-    async saveTaskToFirebase(task) {
+        this.updateSyncIndicator('syncing', 'Chargement...');
+        
         try {
-            this.updateSyncIndicator('syncing', 'Sauvegarde...');
-            
-            if (task.id && typeof task.id === 'string') {
-                // Mise à jour
-                await db.collection('tasks').doc(task.id).update(task);
-            } else {
-                // Création - Retirer l'ID temporaire
-                const { id, ...taskData } = task;
-                await db.collection('tasks').add(taskData);
-            }
-            
-            this.updateSyncIndicator('synced', 'Synchronisé');
+            // Charger uniquement les tâches de l'espace actuel
+            this.unsubscribe = db.collection('tasks')
+                .where('space', '==', this.currentSpace)
+                .onSnapshot((snapshot) => {
+                    // Utiliser Map pour éviter les doublons
+                    this.tasks.clear();
+                    
+                    snapshot.forEach((doc) => {
+                        const data = doc.data();
+                        // Double vérification de l'espace
+                        if (data && data.space === this.currentSpace) {
+                            this.tasks.set(doc.id, {
+                                ...data,
+                                id: doc.id
+                            });
+                        }
+                    });
+                    
+                    this.render();
+                    this.updateSyncIndicator('synced', 'Synchronisé');
+                }, (error) => {
+                    console.error('Erreur:', error);
+                    this.updateSyncIndicator('error', 'Erreur');
+                });
         } catch (error) {
-            console.error('Erreur sauvegarde:', error);
-            this.showNotification('Erreur de sauvegarde', 'error');
+            console.error('Erreur chargement:', error);
             this.updateSyncIndicator('error', 'Erreur');
         }
     }
     
-    // Supprimer une tâche de Firebase
-    async deleteTaskFromFirebase(taskId) {
-        try {
-            this.updateSyncIndicator('syncing', 'Suppression...');
-            await db.collection('tasks').doc(taskId).delete();
-            this.updateSyncIndicator('synced', 'Synchronisé');
-        } catch (error) {
-            console.error('Erreur suppression:', error);
-            this.showNotification('Erreur de suppression', 'error');
-        }
+    getTasksArray() {
+        // Convertir Map en Array pour le rendu
+        return Array.from(this.tasks.values());
     }
     
     setupEventListeners() {
-        // Délégation d'événements pour les clics
         document.addEventListener('click', (e) => {
             const target = e.target;
             
-            // Actions header
             if (target.matches('.icon-btn')) {
                 const action = target.dataset.action;
-                if (action === 'kpi') this.showKPIModal();
+                if (action === 'refresh') this.refresh();
+                else if (action === 'kpi') this.showKPIModal();
                 else if (action === 'export') this.exportTasks();
                 else if (action === 'theme') this.toggleTheme();
             }
             
-            // Changement d'espace
             if (target.matches('.space-btn')) {
                 this.switchSpace(target.dataset.space);
             }
             
-            // Suppression de tâche
             if (target.matches('.delete-btn')) {
                 e.stopPropagation();
                 const taskId = target.closest('.task-card').dataset.taskId;
                 this.deleteTask(taskId);
             }
             
-            // Édition de tâche
             const taskCard = target.closest('.task-card');
             if (taskCard && !target.matches('.delete-btn') && this.draggedTaskId === null) {
                 const taskId = taskCard.dataset.taskId;
                 this.editTask(taskId);
             }
             
-            // Fermeture modale
             if (target.matches('[data-close]')) {
                 this.closeModal(target.dataset.close);
             }
             
-            // Période KPI
             if (target.matches('[data-period]')) {
                 this.showKPIPeriod(target.dataset.period);
             }
         });
         
-        // Boutons flottants
         document.querySelector('.add-task-btn').addEventListener('click', () => this.createTask());
         document.querySelector('.voice-btn').addEventListener('click', () => this.toggleVoiceRecording());
         
-        // Filtres
         document.getElementById('category-filter').addEventListener('change', () => this.render());
         document.getElementById('priority-filter').addEventListener('change', () => this.render());
         document.getElementById('search-filter').addEventListener('input', 
             this.debounce(() => this.render(), 300)
         );
+    }
+    
+    async switchSpace(space) {
+        if (this.currentSpace === space) return;
+        
+        this.currentSpace = space;
+        localStorage.setItem('currentSpace', space);
+        this.updateSpaceButtons();
+        
+        // Recharger les tâches du nouvel espace
+        await this.loadTasks();
+    }
+    
+    updateSpaceButtons() {
+        document.querySelectorAll('.space-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.space === this.currentSpace);
+        });
     }
     
     render() {
@@ -409,8 +354,16 @@ class TaskFlowFirebase {
     }
     
     renderStats() {
-        const stats = this.calculateStats();
-        const currentWeek = this.getWeekNumber(new Date());
+        const tasks = this.getFilteredTasks();
+        const weekAgo = new Date();
+        weekAgo.setDate(weekAgo.getDate() - 7);
+        
+        const stats = {
+            total: tasks.length,
+            todo: tasks.filter(t => t.status === 'todo').length,
+            inProgress: tasks.filter(t => t.status === 'in-progress').length,
+            done: tasks.filter(t => t.status === 'done' && new Date(t.completedAt) > weekAgo).length
+        };
         
         document.querySelector('.stats-cards').innerHTML = `
             <div class="stat-card">
@@ -427,7 +380,7 @@ class TaskFlowFirebase {
             </div>
             <div class="stat-card">
                 <div class="stat-value">${stats.done}</div>
-                <div class="stat-label">Réalisées S${currentWeek}</div>
+                <div class="stat-label">Réalisées S${this.getWeekNumber(new Date())}</div>
             </div>
         `;
     }
@@ -435,40 +388,68 @@ class TaskFlowFirebase {
     renderKanban() {
         const board = document.querySelector('.kanban-board');
         
-        // Créer les colonnes si nécessaire
-        if (!board.children.length) {
-            board.innerHTML = Object.keys(this.statusConfig).map(status => `
-                <div class="kanban-column" data-status="${status}">
-                    <div class="column-header">
-                        <h3 class="column-title">
-                            ${this.statusConfig[status].icon} ${this.statusConfig[status].label}
-                            <span class="column-count">0</span>
-                        </h3>
-                    </div>
-                    <div class="tasks-container" data-status="${status}"></div>
+        // Toujours recréer la structure complète du kanban
+        board.innerHTML = Object.keys(this.statusConfig).map(status => `
+            <div class="kanban-column" data-status="${status}">
+                <div class="column-header">
+                    <h3 class="column-title">
+                        ${this.statusConfig[status].icon} ${this.statusConfig[status].label}
+                        <span class="column-count">0</span>
+                    </h3>
                 </div>
-            `).join('');
-        }
+                <div class="tasks-container" data-status="${status}"></div>
+            </div>
+        `).join('');
         
-        // Vider les conteneurs
-        document.querySelectorAll('.tasks-container').forEach(c => c.innerHTML = '');
-        
-        // Filtrer et afficher les tâches
+        // Ajouter les tâches filtrées
         const filteredTasks = this.getFilteredTasks();
+        const tasksByStatus = {
+            'todo': [],
+            'in-progress': [],
+            'delegated': [],
+            'done': []
+        };
+        
+        // Grouper les tâches par statut
         filteredTasks.forEach(task => {
-            const element = this.createTaskElement(task);
-            const container = document.querySelector(`[data-status="${task.status}"]`);
-            if (container) container.appendChild(element);
+            if (tasksByStatus[task.status]) {
+                tasksByStatus[task.status].push(task);
+            }
         });
         
-        // Mettre à jour les compteurs
-        document.querySelectorAll('.kanban-column').forEach(col => {
-            const count = col.querySelectorAll('.task-card').length;
-            col.querySelector('.column-count').textContent = count;
+        // Ajouter les tâches dans les conteneurs appropriés
+        Object.entries(tasksByStatus).forEach(([status, tasks]) => {
+            const container = document.querySelector(`.tasks-container[data-status="${status}"]`);
+            if (container) {
+                tasks.forEach(task => {
+                    const element = this.createTaskElement(task);
+                    container.appendChild(element);
+                });
+                
+                // Mettre à jour le compteur
+                const column = container.closest('.kanban-column');
+                const countEl = column.querySelector('.column-count');
+                if (countEl) {
+                    countEl.textContent = tasks.length;
+                }
+            }
         });
         
-        // Configurer le drag & drop
         this.setupDragAndDrop();
+    }
+    
+    getFilteredTasks() {
+        const category = document.getElementById('category-filter').value;
+        const priority = document.getElementById('priority-filter').value;
+        const search = document.getElementById('search-filter').value.toLowerCase();
+        
+        return this.getTasksArray().filter(task => {
+            if (task.space !== this.currentSpace) return false;
+            if (category && task.category !== category) return false;
+            if (priority && task.priority !== priority) return false;
+            if (search && !task.title.toLowerCase().includes(search)) return false;
+            return true;
+        });
     }
     
     createTaskElement(task) {
@@ -477,13 +458,11 @@ class TaskFlowFirebase {
         div.dataset.taskId = task.id;
         div.draggable = true;
         
-        // Vérifier l'urgence
         if (task.deadline && task.priority === 'high') {
             const daysUntil = this.getDaysUntilDeadline(task.deadline);
             if (daysUntil <= 1) div.classList.add('urgent');
         }
         
-        // Construire le HTML
         let html = `
             <div class="task-header">
                 <div class="task-title">${this.escapeHtml(task.title)}</div>
@@ -491,21 +470,17 @@ class TaskFlowFirebase {
             </div>
         `;
         
-        // Badge de semaine pour les tâches terminées
         if (task.status === 'done' && task.completedAt) {
             const week = this.getWeekNumber(new Date(task.completedAt));
             html += `<span class="week-badge">S${week}</span>`;
         }
         
-        // Bouton de suppression
         html += `<button class="delete-btn">✕</button>`;
         
-        // Description
         if (task.description) {
             html += `<p>${this.escapeHtml(task.description)}</p>`;
         }
         
-        // Métadonnées
         const meta = [];
         if (task.deadline) {
             const isClose = this.getDaysUntilDeadline(task.deadline) <= 2;
@@ -524,24 +499,14 @@ class TaskFlowFirebase {
         
         div.innerHTML = html;
         
-        // Événements de drag
         div.addEventListener('dragstart', (e) => {
-            e.stopPropagation();
             this.draggedTaskId = task.id;
-            setTimeout(() => {
-                e.target.classList.add('dragging');
-            }, 0);
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', task.id);
+            setTimeout(() => e.target.classList.add('dragging'), 0);
         });
         
         div.addEventListener('dragend', (e) => {
-            e.stopPropagation();
             e.target.classList.remove('dragging');
             this.draggedTaskId = null;
-            document.querySelectorAll('.drag-over').forEach(el => {
-                el.classList.remove('drag-over');
-            });
         });
         
         return div;
@@ -553,7 +518,6 @@ class TaskFlowFirebase {
             
             column.ondragover = (e) => {
                 e.preventDefault();
-                e.dataTransfer.dropEffect = 'move';
                 container.classList.add('drag-over');
             };
             
@@ -563,42 +527,40 @@ class TaskFlowFirebase {
                 }
             };
             
-            column.ondrop = (e) => {
+            column.ondrop = async (e) => {
                 e.preventDefault();
-                e.stopPropagation();
                 container.classList.remove('drag-over');
                 
-                if (this.draggedTaskId !== null) {
+                if (this.draggedTaskId) {
                     const newStatus = column.dataset.status;
-                    this.updateTaskStatus(this.draggedTaskId, newStatus);
-                    this.draggedTaskId = null;
+                    await this.updateTaskStatus(this.draggedTaskId, newStatus);
                 }
             };
         });
     }
     
     async updateTaskStatus(taskId, newStatus) {
-        if (!taskId) return;
-        
-        const task = this.tasks.find(t => t.id === taskId);
+        const task = this.tasks.get(taskId);
         if (!task || task.status === newStatus) return;
         
-        // Si délégation sans personne assignée
         if (newStatus === 'delegated' && !task.delegatedTo) {
             this.delegatingTaskId = taskId;
-            this.draggedTaskId = null;
             this.showDelegateModal();
             return;
         }
         
-        // Mettre à jour le statut
-        task.status = newStatus;
-        if (newStatus === 'done' && !task.completedAt) {
-            task.completedAt = new Date().toISOString();
+        try {
+            const updateData = { status: newStatus };
+            if (newStatus === 'done' && !task.completedAt) {
+                updateData.completedAt = new Date().toISOString();
+            }
+            
+            await db.collection('tasks').doc(taskId).update(updateData);
+            this.showNotification('Statut mis à jour', 'success');
+        } catch (error) {
+            console.error('Erreur:', error);
+            this.showNotification('Erreur de mise à jour', 'error');
         }
-        
-        await this.saveTaskToFirebase(task);
-        this.showNotification('Statut mis à jour', 'success');
     }
     
     createTask() {
@@ -613,15 +575,20 @@ class TaskFlowFirebase {
     
     async deleteTask(taskId) {
         if (confirm('Supprimer cette tâche ?')) {
-            await this.deleteTaskFromFirebase(taskId);
-            this.showNotification('Tâche supprimée', 'success');
+            try {
+                await db.collection('tasks').doc(taskId).delete();
+                this.showNotification('Tâche supprimée', 'success');
+            } catch (error) {
+                console.error('Erreur:', error);
+                this.showNotification('Erreur de suppression', 'error');
+            }
         }
     }
     
     showTaskModal() {
         const modal = document.getElementById('task-modal');
         const isEdit = this.editingTaskId !== null;
-        const task = isEdit ? this.tasks.find(t => t.id === this.editingTaskId) : null;
+        const task = isEdit ? this.tasks.get(this.editingTaskId) : null;
         
         modal.innerHTML = `
             <div class="modal-content">
@@ -699,25 +666,28 @@ class TaskFlowFirebase {
             deadline: data.deadline,
             estimatedTime: parseFloat(data.estimatedTime) || 0,
             delegatedTo: data.delegatedTo,
-            space: this.currentSpace,
-            createdAt: this.editingTaskId ? 
-                (this.tasks.find(t => t.id === this.editingTaskId)?.createdAt || new Date().toISOString()) : 
-                new Date().toISOString()
+            space: this.currentSpace
         };
         
-        if (taskData.status === 'done') {
-            taskData.completedAt = taskData.completedAt || new Date().toISOString();
+        if (taskData.status === 'done' && !this.editingTaskId) {
+            taskData.completedAt = new Date().toISOString();
         }
         
-        if (this.editingTaskId) {
-            taskData.id = this.editingTaskId;
+        try {
+            if (this.editingTaskId) {
+                await db.collection('tasks').doc(this.editingTaskId).update(taskData);
+                this.showNotification('Tâche mise à jour', 'success');
+            } else {
+                taskData.createdAt = new Date().toISOString();
+                await db.collection('tasks').add(taskData);
+                this.showNotification('Tâche créée', 'success');
+            }
+            
+            this.closeModal('task-modal');
+        } catch (error) {
+            console.error('Erreur:', error);
+            this.showNotification('Erreur de sauvegarde', 'error');
         }
-        
-        await this.saveTaskToFirebase(taskData);
-        
-        this.closeModal('task-modal');
-        this.showNotification(this.editingTaskId ? 'Tâche mise à jour' : 'Tâche créée', 'success');
-        this.editingTaskId = null;
     }
     
     showDelegateModal() {
@@ -732,7 +702,7 @@ class TaskFlowFirebase {
                 <form id="delegate-form" onsubmit="app.saveDelegate(event)">
                     <div class="form-group">
                         <label class="form-label">Déléguer à *</label>
-                        <input type="text" class="form-input" name="delegatedTo" required placeholder="Nom de la personne">
+                        <input type="text" class="form-input" name="delegatedTo" required>
                     </div>
                     <div class="form-group">
                         <label class="form-label">Date de relance</label>
@@ -754,17 +724,19 @@ class TaskFlowFirebase {
         if (!this.delegatingTaskId) return;
         
         const formData = new FormData(event.target);
-        const task = this.tasks.find(t => t.id === this.delegatingTaskId);
         
-        if (task) {
-            task.delegatedTo = formData.get('delegatedTo');
-            task.delegateReminder = formData.get('reminder');
-            task.status = 'delegated';
-            
-            await this.saveTaskToFirebase(task);
+        try {
+            await db.collection('tasks').doc(this.delegatingTaskId).update({
+                delegatedTo: formData.get('delegatedTo'),
+                delegateReminder: formData.get('reminder'),
+                status: 'delegated'
+            });
             
             this.closeModal('delegate-modal');
             this.showNotification('Tâche déléguée', 'success');
+        } catch (error) {
+            console.error('Erreur:', error);
+            this.showNotification('Erreur de délégation', 'error');
         }
         
         this.delegatingTaskId = null;
@@ -775,232 +747,102 @@ class TaskFlowFirebase {
             status === 'delegated' ? 'block' : 'none';
     }
     
-    // Reconnaissance vocale améliorée
-    processVoiceCommand(text) {
-        console.log('Commande vocale reçue:', text);
-        const lower = text.toLowerCase();
+    async refresh() {
+        const btn = document.querySelector('[data-action="refresh"]');
+        btn.style.animation = 'spin 1s linear';
         
-        // Extraction intelligente des informations
+        // Forcer le rechargement complet
+        await this.loadTasks();
+        
+        setTimeout(() => {
+            btn.style.animation = '';
+        }, 1000);
+    }
+    
+    // Reconnaissance vocale
+    setupSpeechRecognition() {
+        if (!('webkitSpeechRecognition' in window)) return;
+        
+        this.recognition = new webkitSpeechRecognition();
+        this.recognition.lang = 'fr-FR';
+        this.recognition.continuous = false;
+        
+        this.recognition.onresult = (event) => {
+            const text = event.results[0][0].transcript;
+            this.processVoiceCommand(text);
+        };
+        
+        this.recognition.onerror = () => {
+            this.showNotification('Erreur de reconnaissance vocale', 'error');
+            document.querySelector('.voice-btn').classList.remove('recording');
+        };
+        
+        this.recognition.onend = () => {
+            document.querySelector('.voice-btn').classList.remove('recording');
+        };
+    }
+    
+    toggleVoiceRecording() {
+        const btn = document.querySelector('.voice-btn');
+        
+        if (btn.classList.contains('recording')) {
+            this.recognition.stop();
+        } else {
+            btn.classList.add('recording');
+            this.recognition.start();
+            this.showNotification('Parlez maintenant...', 'success');
+        }
+    }
+    
+    async processVoiceCommand(text) {
         const task = {
-            title: this.extractTitle(text),
+            title: text,
             description: '',
-            category: this.parseCategory(lower),
-            priority: this.parsePriority(lower),
+            category: this.parseCategory(text.toLowerCase()),
+            priority: this.parsePriority(text.toLowerCase()),
             status: 'todo',
-            deadline: this.parseDeadline(lower),
-            estimatedTime: this.parseTime(lower),
-            delegatedTo: this.parseDelegation(lower),
+            deadline: this.parseDeadline(text.toLowerCase()),
+            estimatedTime: 1,
             space: this.currentSpace,
             createdAt: new Date().toISOString()
         };
         
-        // Si délégation détectée, mettre le statut approprié
-        if (task.delegatedTo) {
-            task.status = 'delegated';
+        try {
+            await db.collection('tasks').add(task);
+            this.showNotification(`Tâche ajoutée: ${text}`, 'success');
+        } catch (error) {
+            console.error('Erreur:', error);
+            this.showNotification('Erreur d\'ajout', 'error');
         }
-        
-        this.saveTaskToFirebase(task);
-        this.showNotification(`Tâche ajoutée: ${task.title}`, 'success');
-    }
-    
-    extractTitle(text) {
-        // Retirer les mots-clés de contexte pour garder l'essentiel
-        let title = text;
-        
-        // Patterns à retirer
-        const patterns = [
-            /^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i,
-            /(urgent|urgente|importante?|priorité|prioritaire)/i,
-            /(pour demain|pour après-demain|avant|deadline)/i,
-            /(déléguer à|délégué à|pour|assigner à)/i,
-            /(méthode|qualité|maintenance)/i,
-            /(qui prend|qui dure|durée|temps|heures?|jours?)/i
-        ];
-        
-        // Nettoyer le titre mais garder les mots importants après les mots-clés
-        let cleanTitle = title;
-        
-        // Si la phrase commence par "ajoute/créer/etc", retirer ce début
-        if (/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche)/i.test(cleanTitle)) {
-            cleanTitle = cleanTitle.replace(/^(ajoute|ajouter|créer|crée|nouvelle tâche|tâche):?\s*/i, '');
-        }
-        
-        // Capitaliser la première lettre
-        return cleanTitle.charAt(0).toUpperCase() + cleanTitle.slice(1);
     }
     
     parseCategory(text) {
-        // Recherche plus flexible des catégories
         if (/méthod|process|procéd/i.test(text)) return 'method';
-        if (/qualité|contrôle|audit|norme/i.test(text)) return 'quality';
-        if (/mainten|répara|entretien|SAV/i.test(text)) return 'maintenance';
-        
-        // Catégories basées sur des mots-clés contextuels
-        if (/réunion|meeting|rendez-vous|appel/i.test(text)) return 'method';
-        if (/rapport|document|révision|mise à jour/i.test(text)) return 'quality';
-        if (/vérif|check|test|diagnostic/i.test(text)) return 'maintenance';
-        
+        if (/qualité|contrôle|audit/i.test(text)) return 'quality';
+        if (/mainten|répara|entretien/i.test(text)) return 'maintenance';
         return 'other';
     }
     
     parsePriority(text) {
-        // Détection améliorée de la priorité
-        if (/très urgent|urgentissime|critique|asap|tout de suite/i.test(text)) return 'high';
-        if (/urgent|important|priorit/i.test(text)) return 'high';
-        if (/normal|moyen|standard/i.test(text)) return 'medium';
-        if (/basse?|faible|peut attendre|pas urgent|tranquille/i.test(text)) return 'low';
-        
-        // Par défaut, si une deadline proche est mentionnée
-        if (/aujourd'hui|ce soir|maintenant/i.test(text)) return 'high';
-        if (/demain|domain/i.test(text)) return 'medium';
-        
+        if (/urgent|important/i.test(text)) return 'high';
+        if (/basse|faible/i.test(text)) return 'low';
         return 'medium';
     }
     
     parseDeadline(text) {
         const date = new Date();
-        
-        // Dates relatives
-        if (/aujourd'hui|ce soir|fin de journée/i.test(text)) {
-            return date.toISOString().split('T')[0];
-        }
-        if (/demain|domain/i.test(text)) {
+        if (/demain/i.test(text)) {
             date.setDate(date.getDate() + 1);
             return date.toISOString().split('T')[0];
         }
-        if (/après[- ]demain/i.test(text)) {
+        if (/après.demain/i.test(text)) {
             date.setDate(date.getDate() + 2);
             return date.toISOString().split('T')[0];
         }
-        
-        // Jours de la semaine
-        const jours = {
-            'lundi': 1, 'mardi': 2, 'mercredi': 3, 
-            'jeudi': 4, 'vendredi': 5, 'samedi': 6, 'dimanche': 0
-        };
-        
-        for (const [jour, num] of Object.entries(jours)) {
-            if (text.includes(jour)) {
-                const currentDay = date.getDay();
-                let daysToAdd = num - currentDay;
-                if (daysToAdd <= 0) daysToAdd += 7; // Semaine prochaine
-                date.setDate(date.getDate() + daysToAdd);
-                return date.toISOString().split('T')[0];
-            }
-        }
-        
-        // Détection "dans X jours"
-        const dansXJours = text.match(/dans (\d+) jours?/i);
-        if (dansXJours) {
-            date.setDate(date.getDate() + parseInt(dansXJours[1]));
-            return date.toISOString().split('T')[0];
-        }
-        
-        // Détection "avant le X"
-        const avantLe = text.match(/avant le (\d{1,2})/i);
-        if (avantLe) {
-            const jour = parseInt(avantLe[1]);
-            date.setDate(jour);
-            if (date < new Date()) {
-                date.setMonth(date.getMonth() + 1);
-            }
-            return date.toISOString().split('T')[0];
-        }
-        
         return null;
     }
     
-    parseTime(text) {
-        // Extraction du temps estimé
-        const patterns = [
-            /(\d+)\s*h(?:eure)?s?/i,
-            /(\d+)\s*minute?s?/i,
-            /(\d+)\s*jour?s?/i,
-            /qui (?:prend|dure|prendra)\s*(\d+)/i
-        ];
-        
-        for (const pattern of patterns) {
-            const match = text.match(pattern);
-            if (match) {
-                const value = parseInt(match[1]);
-                if (pattern.toString().includes('minute')) {
-                    return Math.round(value / 60 * 10) / 10; // Convertir en heures
-                }
-                if (pattern.toString().includes('jour')) {
-                    return value * 8; // Considérer 8h par jour
-                }
-                return value;
-            }
-        }
-        
-        // Estimations basées sur des mots-clés
-        if (/rapide|vite|court|petit/i.test(text)) return 0.5;
-        if (/long|longue|complexe|gros|grosse/i.test(text)) return 4;
-        
-        return 1; // Par défaut
-    }
-    
-    parseDelegation(text) {
-        // Patterns pour détecter la délégation
-        const patterns = [
-            /(?:déléguer?|délégué|assigner?|assigné|donner?) (?:à|a) (\w+)/i,
-            /pour (\w+)$/i,
-            /(?:que|demander à) (\w+) (?:de|d')/i,
-            /(\w+) (?:doit|devra|va)/i
-        ];
-        
-        for (const pattern of patterns) {
-            const match = text.match(pattern);
-            if (match && match[1]) {
-                // Capitaliser le nom
-                const nom = match[1];
-                return nom.charAt(0).toUpperCase() + nom.slice(1).toLowerCase();
-            }
-        }
-        
-        return null;
-    }
-    
-    // Autres méthodes utilitaires...
-    
-    getFilteredTasks() {
-        const category = document.getElementById('category-filter').value;
-        const priority = document.getElementById('priority-filter').value;
-        const search = document.getElementById('search-filter').value.toLowerCase();
-        
-        return this.tasks.filter(task => {
-            if (task.space !== this.currentSpace) return false;
-            if (category && task.category !== category) return false;
-            if (priority && task.priority !== priority) return false;
-            if (search && !task.title.toLowerCase().includes(search)) return false;
-            return true;
-        });
-    }
-    
-    calculateStats() {
-        const filtered = this.getFilteredTasks();
-        const weekAgo = new Date();
-        weekAgo.setDate(weekAgo.getDate() - 7);
-        
-        return {
-            total: filtered.length,
-            todo: filtered.filter(t => t.status === 'todo').length,
-            inProgress: filtered.filter(t => t.status === 'in-progress').length,
-            done: filtered.filter(t => 
-                t.status === 'done' && new Date(t.completedAt) > weekAgo
-            ).length
-        };
-    }
-    
-    switchSpace(space) {
-        this.currentSpace = space;
-        localStorage.setItem('currentSpace', space);
-        document.querySelectorAll('.space-btn').forEach(btn => {
-            btn.classList.toggle('active', btn.dataset.space === space);
-        });
-        this.render();
-    }
-    
+    // KPI Modal
     showKPIModal() {
         const modal = document.getElementById('kpi-modal');
         
@@ -1026,7 +868,6 @@ class TaskFlowFirebase {
     }
     
     showKPIPeriod(period) {
-        // Mettre à jour les boutons
         document.querySelectorAll('[data-period]').forEach(btn => {
             btn.className = btn.dataset.period === period ? 'btn btn-primary' : 'btn btn-secondary';
         });
@@ -1060,17 +901,6 @@ class TaskFlowFirebase {
                     <div class="kpi-label">Temps moyen/tâche</div>
                 </div>
             </div>
-            <div class="kpi-chart">
-                <h3>Répartition par catégorie</h3>
-                <div style="display: flex; justify-content: space-around; margin-top: 1rem;">
-                    ${Object.entries(stats.byCategory).map(([cat, count]) => `
-                        <div style="text-align: center;">
-                            <div style="font-size: 2rem; color: var(--p);">${count}</div>
-                            <div style="color: var(--gray); font-size: 0.875rem;">${this.categories[cat] || cat}</div>
-                        </div>
-                    `).join('')}
-                </div>
-            </div>
         `;
     }
     
@@ -1089,32 +919,26 @@ class TaskFlowFirebase {
                 startDate = new Date(now.getFullYear(), 0, 1);
                 break;
         }
-        startDate.setHours(0, 0, 0, 0);
         
-        const spaceTasks = this.tasks.filter(t => t.space === this.currentSpace);
-        const periodTasks = spaceTasks.filter(t => new Date(t.createdAt) >= startDate);
-        const completedTasks = periodTasks.filter(t => t.status === 'done');
+        const tasks = this.getTasksArray().filter(t => 
+            t.space === this.currentSpace && new Date(t.createdAt) >= startDate
+        );
         
-        const totalTime = completedTasks.reduce((sum, t) => sum + (t.estimatedTime || 0), 0);
-        const byCategory = {};
-        
-        periodTasks.forEach(t => {
-            byCategory[t.category] = (byCategory[t.category] || 0) + 1;
-        });
+        const completed = tasks.filter(t => t.status === 'done');
+        const totalTime = completed.reduce((sum, t) => sum + (t.estimatedTime || 0), 0);
         
         return {
-            created: periodTasks.length,
-            completed: completedTasks.length,
-            inProgress: periodTasks.filter(t => t.status === 'in-progress').length,
-            delegated: periodTasks.filter(t => t.status === 'delegated').length,
-            completionRate: periodTasks.length ? Math.round((completedTasks.length / periodTasks.length) * 100) : 0,
-            avgTime: completedTasks.length ? (totalTime / completedTasks.length).toFixed(1) : 0,
-            byCategory
+            created: tasks.length,
+            completed: completed.length,
+            inProgress: tasks.filter(t => t.status === 'in-progress').length,
+            delegated: tasks.filter(t => t.status === 'delegated').length,
+            completionRate: tasks.length ? Math.round((completed.length / tasks.length) * 100) : 0,
+            avgTime: completed.length ? (totalTime / completed.length).toFixed(1) : 0
         };
     }
     
     exportTasks() {
-        const tasks = this.tasks.filter(t => t.space === this.currentSpace);
+        const tasks = this.getTasksArray().filter(t => t.space === this.currentSpace);
         const headers = ['Titre', 'Description', 'Catégorie', 'Priorité', 'Statut', 'Échéance', 'Temps estimé', 'Délégué à'];
         const rows = tasks.map(t => [
             t.title,
@@ -1139,50 +963,54 @@ class TaskFlowFirebase {
         this.showNotification('Export réussi', 'success');
     }
     
-    setupSpeechRecognition() {
-        if (!('webkitSpeechRecognition' in window)) return;
+    // Utilitaires
+    monitorConnection() {
+        window.addEventListener('online', () => {
+            this.updateSyncIndicator('synced', 'En ligne');
+            this.loadTasks();
+        });
         
-        this.recognition = new webkitSpeechRecognition();
-        this.recognition.lang = 'fr-FR';
-        this.recognition.continuous = false;
-        this.recognition.interimResults = false;
-        
-        this.recognition.onresult = (event) => {
-            const transcript = event.results[0][0].transcript;
-            this.processVoiceCommand(transcript);
-        };
-        
-        this.recognition.onerror = () => {
-            this.showNotification('Erreur de reconnaissance vocale', 'error');
-            document.querySelector('.voice-btn').classList.remove('recording');
-        };
-        
-        this.recognition.onend = () => {
-            document.querySelector('.voice-btn').classList.remove('recording');
-        };
+        window.addEventListener('offline', () => {
+            this.updateSyncIndicator('offline', 'Hors ligne');
+        });
     }
     
-    toggleVoiceRecording() {
-        const btn = document.querySelector('.voice-btn');
+    updateSyncIndicator(status, text) {
+        const indicator = document.getElementById('sync-indicator');
+        const icon = document.getElementById('sync-icon');
+        const textEl = document.getElementById('sync-text');
         
-        if (btn.classList.contains('recording')) {
-            this.recognition.stop();
-        } else {
-            btn.classList.add('recording');
-            this.recognition.start();
-            this.showNotification('Parlez maintenant...', 'success');
+        indicator.className = 'sync-indicator';
+        
+        switch(status) {
+            case 'syncing':
+                indicator.classList.add('syncing');
+                icon.textContent = '🔄';
+                break;
+            case 'synced':
+                icon.textContent = '✅';
+                break;
+            case 'offline':
+                indicator.classList.add('offline');
+                icon.textContent = '🔌';
+                break;
+            case 'error':
+                indicator.classList.add('offline');
+                icon.textContent = '❌';
+                break;
         }
+        
+        textEl.textContent = text;
     }
     
     startPeriodicChecks() {
         setInterval(() => this.checkDeadlines(), 60000);
-        this.checkDeadlines();
     }
     
     checkDeadlines() {
         const now = new Date();
-        this.tasks.forEach(task => {
-            if (task.deadline && task.status !== 'done') {
+        this.getTasksArray().forEach(task => {
+            if (task.deadline && task.status !== 'done' && task.space === this.currentSpace) {
                 const daysUntil = this.getDaysUntilDeadline(task.deadline);
                 
                 if (task.priority === 'high' && [5, 3, 1].includes(daysUntil)) {
@@ -1194,21 +1022,14 @@ class TaskFlowFirebase {
         });
     }
     
-    // UI Helpers
     openModal(modalId) {
         document.getElementById(modalId).classList.add('active');
     }
     
     closeModal(modalId) {
-        const modal = document.getElementById(modalId);
-        modal.classList.remove('active');
-        
-        // Réinitialiser les états
-        if (modalId === 'task-modal') {
-            this.editingTaskId = null;
-        } else if (modalId === 'delegate-modal') {
-            this.delegatingTaskId = null;
-        }
+        document.getElementById(modalId).classList.remove('active');
+        if (modalId === 'task-modal') this.editingTaskId = null;
+        if (modalId === 'delegate-modal') this.delegatingTaskId = null;
     }
     
     showNotification(message, type = 'success') {
@@ -1236,7 +1057,6 @@ class TaskFlowFirebase {
         }
     }
     
-    // Date utilities
     formatDate(dateString) {
         return new Date(dateString).toLocaleDateString('fr-FR');
     }
@@ -1266,30 +1086,16 @@ class TaskFlowFirebase {
             timeout = setTimeout(() => func.apply(this, args), wait);
         };
     }
-    
-    // Cleanup on page unload
-    destroy() {
-        if (this.unsubscribe) {
-            this.unsubscribe();
-        }
-    }
 }
 
 // Initialisation
-const app = new TaskFlowFirebase();
-
-// Rendre l'app globale pour les événements inline
+const app = new TaskFlowSync();
 window.app = app;
 
-// Cleanup on page unload
+// Cleanup
 window.addEventListener('beforeunload', () => {
-    app.destroy();
+    if (app.unsubscribe) app.unsubscribe();
 });
-
-// Service Worker pour PWA
-if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
-}
 </script>
 </body>
 </html>
